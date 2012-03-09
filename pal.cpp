@@ -36,6 +36,18 @@ CAdhocLinkerApp theApp;
 
 BOOL CAdhocLinkerApp::InitInstance()
 {
+/*	const TCHAR mname[] = _T("PSP_ADHOC_LINKER_INSTANCE");
+
+	HANDLE hm = OpenMutex(SYNCHRONIZE, FALSE, mname);
+	if(hm)
+	{
+		CloseHandle(hm);
+		return FALSE;
+	}
+
+	CreateMutex(NULL, FALSE, mname);*/
+
+
 	// InitCommonControlsEx() is required on Windows XP if an application
 	// manifest specifies use of ComCtl32.dll version 6 or later to enable
 	// visual styles.  Otherwise, any window creation will fail.

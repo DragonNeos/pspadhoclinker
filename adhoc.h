@@ -3,7 +3,7 @@
 namespace adhoc
 {
 
-#define ADHOC_SIGNATURE			0x32484441		// "ADH2"
+#define ADHOC_SIGNATURE			0x33484441		// "ADH3"
 #define ADHOC_STRLEN			(32+1)			// DOT11_SSID_MAX_LENGTH+1
 #define ADHOC_PINGSIZE			512
 #define ADHOC_MAXCLIENTS		8
@@ -37,6 +37,7 @@ namespace adhoc
 
 	typedef struct ADHOC_DEVICEINFO {
 		ULONGLONG	MacAddress;
+		DWORD		IPAddress;
 		ULONGLONG	P2P;
 		ULONGLONG	Broadcast;
 		CHAR		Name[ADHOC_STRLEN];
@@ -64,6 +65,7 @@ namespace adhoc
 
 	typedef struct ADHOC_DEVICE : public ADHOC_GENERIC {
 		ULONGLONG	MacAddress;
+		DWORD		IPAddress;
 		CHAR		Name[ADHOC_STRLEN];
 	} ADHOC_DEVICE, *PADHOC_DEVICE;
 

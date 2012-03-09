@@ -92,7 +92,7 @@ LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
 IDD_PAL_DIALOG DIALOGEX 0, 0, 352, 200
 STYLE DS_SETFONT | DS_MODALFRAME | DS_FIXEDSYS | WS_MINIMIZEBOX | WS_POPUP | WS_VISIBLE | WS_CAPTION | WS_SYSMENU
 EXSTYLE WS_EX_APPWINDOW
-CAPTION "PSP ADHOC LINKER"
+CAPTION "PSP/PSVITA ADHOC LINKER"
 FONT 8, "MS Shell Dlg", 0, 0, 0x1
 BEGIN
     COMBOBOX        IDC_ADAPTOR,64,3,231,66,CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
@@ -115,7 +115,7 @@ END
 //
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 1,12,3,6
+ FILEVERSION 1,12,3,9
  PRODUCTVERSION 1,0,0,1
  FILEFLAGSMASK 0x3fL
 #ifdef _DEBUG
@@ -133,7 +133,7 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "http://dametensi.net/"
             VALUE "FileDescription", "PSP Adhoc linker"
-            VALUE "FileVersion", "1.12.3.6"
+            VALUE "FileVersion", "1.12.3.9"
             VALUE "InternalName", "pal.exe"
             VALUE "LegalCopyright", "http://dametensi.net/"
             VALUE "OriginalFilename", "pal.exe"

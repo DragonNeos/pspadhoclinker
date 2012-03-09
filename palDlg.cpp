@@ -334,8 +334,6 @@ LRESULT CAdhocLinkerDlg::OnUpdateCtrl(WPARAM wParam, LPARAM lParam)
 		return 0;
 
 	case UC_CAPTURE_FAIL:
-		m_Client.Close();
-
 		MessageBox(_T("Cannot capture packet.\nCheck for WinPcap."));
 		return 0;
 
