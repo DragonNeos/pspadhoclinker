@@ -1,8 +1,10 @@
 #include "StdAfx.h"
 #include "AdhocClient.h"
 
-#include "mmsystem.h"
+#include <mmsystem.h>
+#include <iphlpapi.h>
 
+#pragma comment(lib, "IPHLPAPI.lib")
 #pragma comment(lib, "winmm.lib")
 
 
@@ -33,25 +35,11 @@ AdhocClient::AdhocClient(const da_socket::socket_config &config /*= da_socket::s
 	}
 
 	m_Event_ScanCmpl = CreateEvent(NULL, TRUE, FALSE, NULL);
-	m_Event_ScanExec = CreateEvent(NULL, TRUE, FALSE, NULL);
-
-	m_InCleanup = false;
-
-	m_ScanSSID.create(
-		da_thread::thread_proc(
-			std::tr1::bind(&AdhocClient::ScanSSID, this)));
 }
 
 AdhocClient::~AdhocClient(void)
 {
 	Close();
-
-	m_InCleanup = true;
-
-	PulseEvent(m_Event_ScanExec);
-
-	m_ScanSSID.wait();
-	m_ScanSSID.close();
 
 	if(m_hWLan != INVALID_HANDLE_VALUE)
 	{
@@ -61,7 +49,6 @@ AdhocClient::~AdhocClient(void)
 		WlanCloseHandle(m_hWLan, NULL);
 	}
 
-	CloseHandle(m_Event_ScanExec);
 	CloseHandle(m_Event_ScanCmpl);
 
 	DeleteCriticalSection(&m_MacLock);
@@ -69,17 +56,22 @@ AdhocClient::~AdhocClient(void)
 
 bool AdhocClient::Connect(LPCTSTR address, LPCTSTR service, LPCWSTR adaptor)
 {
-	if(m_socket)
+	if(m_socket || m_hWLan == INVALID_HANDLE_VALUE)
 		return false;
+
+	m_LastPacket = 0;
+	m_LastPacketLen = 0;
 
 	m_LocalMac.clear();
 	m_PeerMac.clear();
 
 	m_Adaptor = adaptor;
-	GetAdaptorGUID();
+	if(!GetAdaptorGUID())
+		return false;
+	if(!GetAdaptorMAC())
+		return false;
 
-	if(m_hWLan != INVALID_HANDLE_VALUE)
-		WlanDisconnect(m_hWLan, &m_AdaptorGUID, NULL);
+	WlanDisconnect(m_hWLan, &m_AdaptorGUID, NULL);
 
 
 	ZeroMemory(&m_AdhocStatus, sizeof(m_AdhocStatus));
@@ -87,25 +79,21 @@ bool AdhocClient::Connect(LPCTSTR address, LPCTSTR service, LPCWSTR adaptor)
 	if(!da_socket::Connect(address, service))
 		return false;
 
-
-	SetEvent(m_Event_ScanExec);
-
-
 	ADHOC_GENERIC gpkt;
 	InitPacket(&gpkt, ADHOC_REQ_CONNECT, sizeof(gpkt));
-
-	if(!Send(&gpkt, sizeof(gpkt)))
-	{
-		Close();
-		return false;
-	}
+	Send(&gpkt, sizeof(gpkt));
 
 	ADHOC_CLIENT cpkt;
 	InitPacket(&cpkt, ADHOC_REQ_CLIENT, sizeof(cpkt));
-
 	strcpy_s(cpkt.Name, ADHOC_STRLEN, m_Name.c_str());
-
 	Send(&cpkt, sizeof(cpkt));
+
+
+	m_InCleanup = false;
+
+	m_ScanSSID.create(
+		da_thread::thread_proc(
+			std::tr1::bind(&AdhocClient::ScanSSID, this)));
 
 
 	m_PacketCapture.create(
@@ -148,18 +136,15 @@ void AdhocClient::OnReceived(LPVOID pBuffer, DWORD length)
 
 void AdhocClient::OnDisconnect(void)
 {
+	m_InCleanup = true;
 	SetEvent(m_Event_ScanCmpl);
-
-/*	if(m_hPcap)
-	{
-		pcap_breakloop(m_hPcap);
-	}*/
 
 	m_PacketCapture.wait();
 	m_PacketCapture.close();
 
-	if(m_hWLan != INVALID_HANDLE_VALUE)
-		WlanDisconnect(m_hWLan, &m_AdaptorGUID, NULL);
+	m_ScanSSID.wait();
+	m_ScanSSID.close();
+
 
 	if(m_Notify)
 	{
@@ -194,13 +179,17 @@ bool AdhocClient::ProcPacket(PADHOC_GENERIC packet)
 			EnterCriticalSection(&m_MacLock);
 
 			m_PeerMac.clear();
+			m_PeerIP.clear();
 
 			for(ULONG i = 0; i < spkt->DeviceInfoCount; i++)
 			{
-				if(m_LocalMac.find(spkt->DeviceInfo[i].MacAddress) != m_LocalMac.end())
+				ADHOC_DEVICEINFO &di = spkt->DeviceInfo[i];
+
+				if(m_LocalMac.find(di.MacAddress) != m_LocalMac.end())
 					continue;
 
-				m_PeerMac.insert(spkt->DeviceInfo[i].MacAddress);
+				m_PeerMac.insert(di.MacAddress);
+				m_PeerIP[di.IPAddress] = di.MacAddress;
 			}
 
 			mac_map::iterator itr = m_LocalMac.begin();
@@ -226,20 +215,17 @@ bool AdhocClient::ProcPacket(PADHOC_GENERIC packet)
 		{
 			PADHOC_GENERIC gpkt = (PADHOC_GENERIC)packet;
 
-			LPBYTE pkt_data = (LPBYTE)(packet+1);
-
-			ULONGLONG src = *(PULONGLONG)(pkt_data+6) & 0x0000FFFFFFFFFFFF;
+			PETHERNET eth = (PETHERNET)(packet+1);
 
 			EnterCriticalSection(&m_MacLock);
-			if(m_PeerMac.find(src) == m_PeerMac.end())
-			{
-				LeaveCriticalSection(&m_MacLock);
-				break;
-			}
+			bool issend = m_PeerMac.find((ULONGLONG)eth->Source) != m_PeerMac.end();
 			LeaveCriticalSection(&m_MacLock);
 
-			if(m_hPcap)
+			if(m_hPcap && issend)
 			{
+				if(eth->Type != PROTOCOL_PSP)
+					eth->Source = m_AdaptorMAC;
+
 				int ret = pcap_sendpacket(m_hPcap, (LPBYTE)(gpkt+1), gpkt->Length);
 				if(ret != 0)
 				{
@@ -287,28 +273,72 @@ bool AdhocClient::GetAdaptors(adaptor_list &adaptors)
 	return true;
 }
 
-void AdhocClient::GetAdaptorGUID(void)
+bool AdhocClient::GetAdaptorGUID(void)
 {
-	if(m_hWLan == INVALID_HANDLE_VALUE)
-		return;
-
 	ZeroMemory(&m_AdaptorGUID, sizeof(m_AdaptorGUID));
 
 	PWLAN_INTERFACE_INFO_LIST ilist;
 
 	if(WlanEnumInterfaces(m_hWLan, NULL, &ilist) != ERROR_SUCCESS)
-		return;
+		return false;
+
+	bool ret = false;
 
 	for(DWORD i = 0; i < ilist->dwNumberOfItems; i++)
 	{
 		if(!wcscmp(m_Adaptor.c_str(), ilist->InterfaceInfo[i].strInterfaceDescription))
 		{
 			m_AdaptorGUID = ilist->InterfaceInfo[i].InterfaceGuid;
+			ret = true;
 			break;
 		}
 	}
 
 	WlanFreeMemory(ilist);
+
+	return ret;
+}
+
+bool AdhocClient::GetAdaptorMAC(void)
+{
+	ULONG sz = 0;
+	if(GetAdaptersInfo(NULL, &sz) != ERROR_BUFFER_OVERFLOW)
+		return false;
+
+	if(!sz) return false;
+
+	std::vector<BYTE> buf;
+	buf.resize(sz);
+
+	IP_ADAPTER_INFO *pInfo = (IP_ADAPTER_INFO*)&buf[0];
+
+	if(GetAdaptersInfo(pInfo, &sz) != ERROR_SUCCESS)
+		return false;
+
+	CHAR devname[MAX_PATH];
+
+	GUID &g = m_AdaptorGUID;
+	sprintf_s(devname, MAX_PATH, "{%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
+		g.Data1, g.Data2, g.Data3, g.Data4[0], g.Data4[1], g.Data4[2], g.Data4[3], g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7]);
+
+	while(pInfo)
+	{
+		do {
+			if(strcmp(devname, pInfo->AdapterName))
+				break;
+
+			if(pInfo->AddressLength != 6)
+				break;
+
+			m_AdaptorMAC = *(PULONGLONG)(pInfo->Address) & 0x0000FFFFFFFFFFFF;
+			return true;
+
+		} while(false);
+
+		pInfo = pInfo->Next;
+	}
+
+	return false;
 }
 
 void AdhocClient::WlanNotification(PWLAN_NOTIFICATION_DATA data)
@@ -334,16 +364,13 @@ DWORD AdhocClient::ScanSSID(void)
 
 	while(!m_InCleanup)
 	{
-		if(WaitForSingleObject(m_Event_ScanExec, 100) != WAIT_OBJECT_0)
+		if((timeGetTime() - m_LastPacket) < 4000)
 		{
-			if((timeGetTime() - m_LastPaket) < 4000)
-				continue;
-
-			WlanDisconnect(m_hWLan, &m_AdaptorGUID, NULL);
+			Sleep(1);
+			continue;
 		}
 
-		if(m_InCleanup)
-			break;
+		WlanDisconnect(m_hWLan, &m_AdaptorGUID, NULL);
 
 		ResetEvent(m_Event_ScanCmpl);
 
@@ -394,10 +421,8 @@ DWORD AdhocClient::ScanSSID(void)
 				(CHAR*)panl->Network[index].dot11Ssid.ucSSID,
 				panl->Network[index].dot11Ssid.uSSIDLength);
 
-			m_LastPaket = timeGetTime();
+			m_LastPacket = timeGetTime();
 		}
-
-		ResetEvent(m_Event_ScanExec);
 
 		Send(&cpkt, sizeof(cpkt));
 	}
@@ -476,7 +501,7 @@ DWORD AdhocClient::PacketCapture(void)
 							65536,			// portion of the packet to capture. 
 											// 65536 grants that the whole packet will be captured on all the MACs.
 							1,				// promiscuous mode (nonzero means promiscuous)
-							100,			// read timeout
+							1,				// read timeout
 							errbuf			// error buffer
 							);
 
@@ -492,14 +517,13 @@ DWORD AdhocClient::PacketCapture(void)
 	const u_char *pkt_data;
 	struct pcap_pkthdr *pkt_header;
 
-	while(m_socket)
+	while(!m_InCleanup)
 	{
 		if(pcap_next_ex(m_hPcap, &pkt_header, &pkt_data) == 1)
 		{
 			PacketHandler(pkt_header, pkt_data);
 		}
 	}
-//	pcap_loop(m_hPcap, 0, PacketHandlerProc, (u_char*)this);
 
 	pcap_close(m_hPcap);
 	m_hPcap = NULL;
@@ -507,34 +531,44 @@ DWORD AdhocClient::PacketCapture(void)
 	return 0;
 }
 
-void AdhocClient::PacketHandlerProc(u_char *param, const struct pcap_pkthdr *header, const u_char *pkt_data)
-{
-	// filter for invalid packet
-	if(header->len < (6+6+2))
-		return;
-
-	AdhocClient *ac = (AdhocClient*)param;
-	ac->PacketHandler(header, pkt_data);
-}
-
 void AdhocClient::PacketHandler(const struct pcap_pkthdr *header, const u_char *pkt_data)
 {
-	PADHOC_GENERIC pkt = (PADHOC_GENERIC)(&m_PacketBuffer[0]);
-	ULONG length = m_PacketBuffer.size();
 	ULONG sendsize = header->len + sizeof(ADHOC_GENERIC);
 
-	if(sendsize > length)
+	if(sendsize > m_PacketBuffer.size())
 	{
 		// skip large packet
 		return;
 	}
 
-	ULONGLONG dest = *(PULONGLONG)(pkt_data) & 0x0000FFFFFFFFFFFF;
-	ULONGLONG src = *(PULONGLONG)(pkt_data+6) & 0x0000FFFFFFFFFFFF;
-	WORD type = *(PWORD)(pkt_data+12);
+	PETHERNET eth = (PETHERNET)pkt_data;
 
-	if(src == 0x0000FFFFFFFFFFFF)
+	ULONGLONG dest = eth->Destination;
+	ULONGLONG src = eth->Source;
+	WORD type = eth->Type;
+
+	if(src == m_AdaptorMAC)
+	{
+		// skip echo/ICMP packet
 		return;
+	}
+
+	switch(type)
+	{
+	case PROTOCOL_ARP:
+		ReplyARP((PARPHEADER)eth);
+		return;
+
+	case PROTOCOL_PSP:
+	case PROTOCOL_INTERNET:
+		// Process PSP/IP Packet
+		break;
+
+	default:
+		// Not processing packet
+		return;
+	}
+
 
 	EnterCriticalSection(&m_MacLock);
 	if(m_PeerMac.find(src) != m_PeerMac.end())
@@ -549,43 +583,51 @@ void AdhocClient::PacketHandler(const struct pcap_pkthdr *header, const u_char *
 	{
 		switch(type)
 		{
-		case 0xC888:
+		case PROTOCOL_PSP:
 			{
-				// New device arrival
-				ADHOC_DEVICE dpkt;
-				InitPacket(&dpkt, ADHOC_REQ_DEVICE, sizeof(dpkt));
-				dpkt.MacAddress = src;
-				strcpy_s(dpkt.Name, ADHOC_STRLEN, "unknown");
-				Send(&dpkt, sizeof(dpkt));
+				PPSPHEADER ph = (PPSPHEADER)eth;
+
+				if(header->len < sizeof(PSPHEADER) ||
+					ph->Signature != 0x02010100 ||
+					ph->Code != 0x8000)
+					break;
+
+				// New PSP device arrival
+				m_LocalMac[src];
+				i = m_LocalMac.find(src);
+
+				// PSP Device name packet
+				InitPacket(&i->second, ADHOC_REQ_DEVICE, sizeof(i->second));
+				i->second.MacAddress = src;
+				strcpy_s(i->second.Name, ADHOC_STRLEN, ph->Name);
+				Send(&i->second, sizeof(i->second));
 			}
 			break;
 
-		case 0x0008:
+		case PROTOCOL_INTERNET:
 			{
 				// Internet Protocol
-				PIPHEADER ip = (PIPHEADER)(pkt_data+6+6+2);
+				PIPHEADER ip = (PIPHEADER)eth;
 				BYTE hlen = (ip->HeaderInfo&0x0F) << 2;
 
-				bool isPSV = false;
-
 				do {
-					if(header->len < ULONG(6+6+2+hlen))
+					if(header->len < ULONG(sizeof(ETHERNET)+hlen))
 						break;
 
-					if(ip->Protocol != 0x11)
+					if(ip->Protocol != PROTOCOL_UDP)
 						break;
 
-					if(header->len < ULONG(6+6+2+hlen+sizeof(UDPHEADER)))
+					if(header->len < ULONG(sizeof(ETHERNET)+hlen+sizeof(UDPHEADER)))
 						break;
 
-					PUDPHEADER udp = (PUDPHEADER)(pkt_data+6+6+2+hlen);
-					if(udp->SourcePort != 0x4A0E ||
-						udp->DestinationPort != 0x4A0E)
+					PUDPHEADER udp = (PUDPHEADER)(LPBYTE(eth+1)+hlen);
+					if(udp->SourcePort != PORT_PSAMS ||
+						udp->DestinationPort != PORT_PSAMS)
 						break;
 
 					WORD ulen = (udp->Length>>8) | (udp->Length<<8);
 
-					if(header->len < ULONG(6+6+2+hlen+ulen))
+					if(header->len < ULONG(sizeof(ETHERNET)+hlen+ulen))
 						break;
 
 					const BYTE head[] = {0xFF, 0xA3, 0x82, 0x36, 0x82, 0x35, 0xC2,
@@ -597,51 +639,54 @@ void AdhocClient::PacketHandler(const struct pcap_pkthdr *header, const u_char *
 					if(memcmp(udp+1, head, sizeof(head)))
 						break;
 
-					// New device arrival
-					ADHOC_DEVICE dpkt;
-					InitPacket(&dpkt, ADHOC_REQ_DEVICE, sizeof(dpkt));
-					dpkt.MacAddress = src;
-					strcpy_s(dpkt.Name, ADHOC_STRLEN, (CHAR*)(udp+1)+sizeof(head));
-					Send(&dpkt, sizeof(dpkt));
+					// New PSVITA device arrival
+					m_LocalMac[src];
+					i = m_LocalMac.find(src);
 
-					isPSV = true;
+					// PSVITA Device name packet
+					InitPacket(&i->second, ADHOC_REQ_DEVICE, sizeof(i->second));
+					i->second.MacAddress = src;
+					i->second.IPAddress = ip->SourceAddr;
+					strcpy_s(i->second.Name, ADHOC_STRLEN, (CHAR*)(udp+1)+sizeof(head));
+					Send(&i->second, sizeof(i->second));
 
 				} while(false);
-
-				if(!isPSV)
-				{
-					LeaveCriticalSection(&m_MacLock);
-					// Unknown device
-					return;
-				}
 			}
 			break;
+		}
 
-		default:
+		if(i == m_LocalMac.end())
+		{
 			LeaveCriticalSection(&m_MacLock);
 			// Unknown device
 			return;
 		}
-
-		m_LocalMac[src];
-		i = m_LocalMac.find(src);
 	}
-
-	if(i->second.empty())
+	else
 	{
-		if(type == 0xC888 &&
-			header->len > (6+6+2+4+2+16) &&
-			*(PDWORD)(pkt_data+6+6+2) == 0x02010100 &&
-			*(PWORD)(pkt_data+6+6+2+4) == 0x8000)
+		switch(type)
 		{
-			// PSP Device name packet
-			i->second = (CHAR*)(pkt_data+6+6+2+4+2);
+		case PROTOCOL_INTERNET:
+			{
+				// Internet Protocol
+				PIPHEADER ip = (PIPHEADER)eth;
 
-			ADHOC_DEVICE dpkt;
-			InitPacket(&dpkt, ADHOC_REQ_DEVICE, sizeof(dpkt));
-			dpkt.MacAddress = src;
-			strcpy_s(dpkt.Name, ADHOC_STRLEN, i->second.c_str());
-			Send(&dpkt, sizeof(dpkt));
+				if(ip->SourceAddr != i->second.IPAddress)
+				{
+					// PSVITA IP Address changed
+					i->second.TimeStamp = timeGetTime();
+					i->second.IPAddress = ip->SourceAddr;
+					Send(&i->second, sizeof(i->second));
+				}
+
+				ip_map::iterator imap = m_PeerIP.find(ip->DestinationAddr);
+				if(imap == m_PeerIP.end())
+					break;
+
+				// Address transform
+				dest = imap->second;
+			}
+			break;
 		}
 	}
 
@@ -658,6 +703,8 @@ void AdhocClient::PacketHandler(const struct pcap_pkthdr *header, const u_char *
 	LeaveCriticalSection(&m_MacLock);
 
 
+	PADHOC_GENERIC pkt = (PADHOC_GENERIC)(&m_PacketBuffer[0]);
+
 	pkt->Signature = ADHOC_SIGNATURE;
 	pkt->Length = header->len;
 	pkt->TimeStamp = timeGetTime();
@@ -665,7 +712,51 @@ void AdhocClient::PacketHandler(const struct pcap_pkthdr *header, const u_char *
 
 	memcpy(pkt+1, pkt_data, header->len);
 
+	if(eth->Destination != dest)
+	{
+		eth = (PETHERNET)(pkt+1);
+		eth->Destination = dest;
+	}
+
 	Send(pkt, sendsize);
 
-	m_LastPaket = pkt->TimeStamp;
+	m_LastPacketLen = header->len;
+
+	m_LastPacket = pkt->TimeStamp;
+}
+
+void AdhocClient::ReplyARP(const PARPHEADER arp)
+{
+	if(arp->HardwareType != 0x0100 ||
+		arp->ProtocolType != PROTOCOL_INTERNET ||
+		arp->HardwareSize != 6 ||
+		arp->ProtocolSize != 4 ||
+		arp->Opcode != OPCODE_REQUEST)
+		return;
+
+	EnterCriticalSection(&m_MacLock);
+
+	bool isreply = m_PeerIP.find(arp->TargetIP) != m_PeerIP.end();
+
+	LeaveCriticalSection(&m_MacLock);
+
+	if(!isreply)
+		return;
+
+
+	// Reply ARP Packet
+	ARPHEADER reply = *arp;
+
+	reply.Source = m_AdaptorMAC;
+	reply.Destination = arp->SenderMAC;
+
+	reply.Opcode = OPCODE_REPLY;
+
+	reply.SenderMAC = m_AdaptorMAC;
+	reply.SenderIP = arp->TargetIP;
+
+	reply.TargetMAC = arp->SenderMAC;
+	reply.TargetIP = arp->SenderIP;
+
+	pcap_sendpacket(m_hPcap, (LPBYTE)&reply, sizeof(reply));
 }

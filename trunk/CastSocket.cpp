@@ -94,6 +94,7 @@ bool CastSocket::ProcPacket(PADHOC_GENERIC packet)
 				dev.Broadcast = 0;
 				dev.P2P = 0;
 			}
+			dev.IPAddress = dpkt->IPAddress;
 			strcpy_s(dev.Name, ADHOC_STRLEN, dpkt->Name);
 
 			LeaveCriticalSection(&m_DevLock);
